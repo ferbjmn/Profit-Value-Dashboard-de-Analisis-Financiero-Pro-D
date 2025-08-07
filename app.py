@@ -1,13 +1,12 @@
 # -------------------------------------------------------------
 #  📊 DASHBOARD FINANCIERO AVANZADO
-#      (ROIC & EVA alineados con GuruFocus/Finviz)
+#      ROIC y WACC con Kd y tasa efectiva por empresa
 # -------------------------------------------------------------
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import time
-from datetime import datetime, timedelta
 
 # -------------------------------------------------------------
 # ⚙️ Configuración global de la página
@@ -20,195 +19,125 @@ st.set_page_config(
 )
 
 # -------------------------------------------------------------
-# Parámetros WACC por defecto (ajustables en el sidebar)
+# Parámetros CAPM por defecto (editables en el sidebar)
 # -------------------------------------------------------------
-Rf = 0.0435   # Tasa libre de riesgo
-Rm = 0.085    # Retorno esperado del mercado
-Tc = 0.21     # Tasa impositiva corporativa
+Rf  = 0.0435   # tasa libre de riesgo
+Rm  = 0.085    # retorno esperado del mercado (= Rf + prima)
+Tc0 = 0.21     # tasa impositiva por defecto
 
 # =============================================================
 # 1. FUNCIONES AUXILIARES
 # =============================================================
 def safe_first(obj):
-    """Devuelve el primer valor no nulo de una serie o el propio escalar."""
-    if obj is None:
+    if obj is None: 
         return None
     if hasattr(obj, "dropna"):
         obj = obj.dropna()
-        return obj.iloc[0] if not obj.empty else None
-    return obj
+    return obj.iloc[0] if hasattr(obj, "iloc") and not obj.empty else obj
 
-def get_cash_equivalents(bs, info):
-    """Localiza efectivo y equivalentes en el balance o en .info."""
-    for k in [
-        "Cash And Cash Equivalents",
-        "Cash And Cash Equivalents At Carrying Value",
-        "Cash Cash Equivalents And Short Term Investments",
-    ]:
-        if k in bs.index:
-            return bs.loc[k]
-    return pd.Series([info.get("totalCash")], index=bs.columns[:1])
-
-def get_ebit(tkr):
-    """Obtiene EBIT (o equivalente) desde diferentes estados."""
-    keys = ["EBIT", "Operating Income", "Earnings Before Interest and Taxes"]
+def seek_row(df, keys):
+    """Devuelve la primera fila que coincida con alguna clave; serie cero si no existe."""
     for k in keys:
-        if k in tkr.financials.index:
-            return tkr.financials.loc[k]
-        if k in tkr.income_stmt.index:
-            return tkr.income_stmt.loc[k]
-    # Último recurso: campo directo
-    return pd.Series([tkr.info.get("ebit")], index=tkr.financials.columns[:1])
+        if k in df.index:
+            return df.loc[k]
+    return pd.Series([0], index=df.columns[:1])
 
-def invested_capital_avg(debt, equity, cash_eq):
-    """Promedio de 2 años de (Deuda + Equity – Cash & Equivalents)."""
-    def ic(i):
-        return (debt.iloc[i] or 0) + (equity.iloc[i] or 0) - (cash_eq.iloc[i] or 0)
-    current = ic(0)
-    previous = ic(1) if len(debt) > 1 else current
-    return (current + previous) / 2 or None
+def calc_ke(beta):
+    """Costo del equity vía CAPM."""
+    return Rf + beta * (Rm - Rf)
 
-def calcular_wacc(info, total_debt):
-    """WACC clásico usando CAPM + coste de deuda implícito."""
-    beta  = info.get("beta", 1.0)
-    price = info.get("currentPrice")
-    shares = info.get("sharesOutstanding")
-    market_cap = price * shares if price and shares else 0
+def calc_kd(interest, debt):
+    """Costo de la deuda según gastos por intereses."""
+    return interest / debt if debt else 0
 
-    Re = Rf + beta * (Rm - Rf)
-    Rd = 0.055 if total_debt else 0
-
-    if market_cap + total_debt == 0:
+def calc_wacc(mcap, debt, ke, kd, tax_rate):
+    total = mcap + debt
+    if total == 0:
         return None
+    return (mcap / total) * ke + (debt / total) * kd * (1 - tax_rate)
 
-    return (market_cap / (market_cap + total_debt)) * Re + \
-           (total_debt / (market_cap + total_debt)) * Rd * (1 - Tc)
-
-def calcular_crecimiento_historico(financials, metric):
-    """CAGR a 4 periodos si hay datos suficientes."""
-    if metric not in financials.index:
+def cagr4(fin, metric):
+    """CAGR de 3-4 años si hay datos suficientes."""
+    if metric not in fin.index:
         return None
-    datos = financials.loc[metric].dropna().iloc[:4]
-    if len(datos) < 2 or datos.iloc[-1] == 0:
+    vals = fin.loc[metric].dropna().iloc[:4]
+    if len(vals) < 2 or vals.iloc[-1] == 0:
         return None
-    años = len(datos) - 1
-    return (datos.iloc[0] / datos.iloc[-1]) ** (1 / años) - 1
+    return (vals.iloc[0] / vals.iloc[-1]) ** (1 / (len(vals) - 1)) - 1
 
 # =============================================================
 # 2. OBTENCIÓN DE DATOS POR EMPRESA
 # =============================================================
-def obtener_datos_financieros(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        info  = stock.info
-        bs    = stock.balance_sheet
+def obtener_datos_financieros(ticker, Tc_def):
+    tkr  = yf.Ticker(ticker)
+    info = tkr.info
+    bs   = tkr.balance_sheet
+    fin  = tkr.financials
+    cf   = tkr.cashflow
 
-        # ---- Validaciones mínimas --------------------------------------
-        if not info or bs.empty:
-            raise ValueError("info o balance_sheet vacío")
+    if not info or bs.empty:
+        raise ValueError("Información o balance_sheet vacío")
 
-        fin   = stock.financials
-        cf    = stock.cashflow
+    # --------- Elementos de capital -----------------------------------
+    beta  = info.get("beta", 1)
+    ke    = calc_ke(beta)
 
-        # ---- EBIT & NOPAT ---------------------------------------------
-        ebit_series = get_ebit(stock)
-        nopat = safe_first(ebit_series)
-        if nopat is not None:
-            nopat *= (1 - Tc)
+    debt_series = seek_row(bs, ["Total Debt", "Long Term Debt"])
+    debt_now    = safe_first(debt_series) or info.get("totalDebt") or 0
 
-        # ---- Capital invertido promedio (2 años, neto de efectivo) ----
-        debt_series = (
-            bs.loc["Total Debt"] if "Total Debt" in bs.index
-            else bs.loc.get("Long Term Debt", 0) + bs.loc.get("Short Term Debt", 0)
-        )
-        equity_series = (
-            bs.loc["Total Stockholder Equity"]
-            if "Total Stockholder Equity" in bs.index
-            else pd.Series([info.get("totalStockholderEquity")], index=bs.columns[:1])
-        )
-        cash_series = get_cash_equivalents(bs, info)
-        invested_capital = invested_capital_avg(debt_series, equity_series, cash_series)
+    cash_series   = seek_row(bs, ["Cash And Cash Equivalents",
+                                  "Cash And Cash Equivalents At Carrying Value",
+                                  "Cash Cash Equivalents And Short Term Investments"])
+    equity_series = seek_row(bs, ["Common Stock Equity", "Total Stockholder Equity"])
 
-        # ---- ROIC ------------------------------------------------------
-        roic = nopat / invested_capital if (nopat is not None and invested_capital) else None
+    # --------- Estado de resultados -----------------------------------
+    interest_exp = safe_first(seek_row(fin, ["Interest Expense"]))
+    ebt          = safe_first(seek_row(fin, ["Ebt", "EBT"]))
+    tax_exp      = safe_first(seek_row(fin, ["Income Tax Expense"]))
+    ebit         = safe_first(seek_row(fin, ["EBIT", "Operating Income",
+                                             "Earnings Before Interest and Taxes"]))
 
-        # ---- WACC ------------------------------------------------------
-        total_debt_now = safe_first(debt_series) or info.get("totalDebt") or 0
-        wacc = calcular_wacc(info, total_debt_now)
+    kd        = calc_kd(interest_exp, debt_now)
+    tax_rate  = tax_exp / ebt if ebt else Tc_def
+    mcap      = info.get("marketCap", 0)
+    wacc      = calc_wacc(mcap, debt_now, ke, kd, tax_rate)
 
-        # ---- EVA -------------------------------------------------------
-        eva = (roic - wacc) * invested_capital if all(
-            v is not None for v in [roic, wacc, invested_capital]
-        ) else None
+    # --------- ROIC & EVA ---------------------------------------------
+    nopat = ebit * (1 - tax_rate) if ebit is not None else None
+    invested_cap = safe_first(equity_series) + (debt_now - safe_first(cash_series))
+    roic = nopat / invested_cap if (nopat is not None and invested_cap) else None
+    eva  = (roic - wacc) * invested_cap if all(v is not None for v in (roic, wacc, invested_cap)) else None
 
-        # ---- Otros ratios / datos -------------------------------------
-        price  = info.get("currentPrice")
-        pfcf   = None
-        fcf    = cf.loc["Free Cash Flow"].iloc[0] if "Free Cash Flow" in cf.index else None
-        shares = info.get("sharesOutstanding")
-        if fcf and shares:
-            pfcf = price / (fcf / shares)
+    # --------- Otros ratios -------------------------------------------
+    price = info.get("currentPrice")
+    fcf   = safe_first(seek_row(cf, ["Free Cash Flow"]))
+    shares = info.get("sharesOutstanding")
+    pfcf  = price / (fcf / shares) if (fcf and shares) else None
 
-        revenue_growth = calcular_crecimiento_historico(fin, "Total Revenue")
-        eps_growth     = calcular_crecimiento_historico(fin, "Net Income")
-        fcf_growth     = calcular_crecimiento_historico(cf, "Free Cash Flow") or \
-                         calcular_crecimiento_historico(cf, "Operating Cash Flow")
-
-        cash_ratio = info.get("cashRatio")
-        ocf = cf.loc["Operating Cash Flow"].iloc[0] if "Operating Cash Flow" in cf.index else None
-        current_liab = bs.loc["Total Current Liabilities"].iloc[0] \
-                       if "Total Current Liabilities" in bs.index else None
-        cash_flow_ratio = (ocf / current_liab) if (ocf and current_liab) else None
-
-        return {
-            # --- básicos ---
-            "Ticker": ticker,
-            "Nombre": info.get("longName", ticker),
-            "Sector": info.get("sector", "N/D"),
-            "País":   info.get("country", "N/D"),
-            "Industria": info.get("industry", "N/D"),
-            "Precio": price,
-
-            # --- valoración y dividendo ---
-            "P/E": info.get("trailingPE"),
-            "P/B": info.get("priceToBook"),
-            "P/FCF": pfcf,
-            "Dividend Year": info.get("dividendRate"),
-            "Dividend Yield %": info.get("dividendYield"),
-            "Payout Ratio": info.get("payoutRatio"),
-
-            # --- rentabilidad ---
-            "ROA": info.get("returnOnAssets"),
-            "ROE": info.get("returnOnEquity"),
-
-            # --- liquidez y deuda ---
-            "Current Ratio": info.get("currentRatio"),
-            "Quick Ratio":   info.get("quickRatio"),
-            "LtDebt/Eq": info.get("longTermDebtToEquity"),
-            "Debt/Eq":  info.get("debtToEquity"),
-
-            # --- márgenes ---
-            "Oper Margin":   info.get("operatingMargins"),
-            "Profit Margin": info.get("profitMargins"),
-
-            # --- métricas avanzadas ---
-            "WACC": wacc,
-            "ROIC": roic,
-            "EVA":  eva,
-
-            # --- crecimientos ---
-            "Revenue Growth": revenue_growth,
-            "EPS Growth":     eps_growth,
-            "FCF Growth":     fcf_growth,
-
-            # --- otros ---
-            "Cash Ratio": cash_ratio,
-            "Cash Flow Ratio": cash_flow_ratio,
-            "Operating Cash Flow": ocf,
-            "Current Liabilities": current_liab,
-        }
-    except Exception as e:
-        return {"Ticker": ticker, "Error": str(e)}
+    return {
+        "Ticker": ticker,
+        "Sector": info.get("sector"),
+        "Precio": price,
+        "P/E": info.get("trailingPE"),
+        "P/B": info.get("priceToBook"),
+        "P/FCF": pfcf,
+        "Dividend Yield %": info.get("dividendYield"),
+        "Payout Ratio": info.get("payoutRatio"),
+        "ROA": info.get("returnOnAssets"),
+        "ROE": info.get("returnOnEquity"),
+        "Current Ratio": info.get("currentRatio"),
+        "Quick Ratio": info.get("quickRatio"),
+        "Debt/Eq": info.get("debtToEquity"),
+        "LtDebt/Eq": info.get("longTermDebtToEquity"),
+        "Oper Margin": info.get("operatingMargins"),
+        "Profit Margin": info.get("profitMargins"),
+        "WACC": wacc,
+        "ROIC": roic,
+        "EVA": eva,
+        "Revenue Growth": cagr4(fin, "Total Revenue"),
+        "EPS Growth":     cagr4(fin, "Net Income"),
+        "FCF Growth":     cagr4(cf, "Free Cash Flow") or cagr4(cf, "Operating Cash Flow"),
+    }
 
 # =============================================================
 # 3. INTERFAZ PRINCIPAL
@@ -216,68 +145,61 @@ def obtener_datos_financieros(ticker):
 def main():
     st.title("📊 Dashboard de Análisis Financiero Avanzado")
 
-    # -------------- Sidebar -----------------------------------
+    # ---------- Sidebar ---------------------------------------
     with st.sidebar:
         st.header("⚙️ Configuración")
-        tickers_input = st.text_area("🔎 Ingresa tickers (coma)", "HRL, AAPL, MSFT")
-        max_tickers   = st.slider("Número máximo de tickers", 1, 50, 20)
-
+        tk_in = st.text_area("Tickers (coma)", "HRL, AAPL, MSFT")
+        max_t = st.slider("Máx tickers", 1, 50, 20)
         st.markdown("---")
-        global Rf, Rm, Tc
-        Rf = st.number_input("Tasa libre de riesgo (%)", 0.0, 20.0, 4.35) / 100
-        Rm = st.number_input("Retorno esperado del mercado (%)", 0.0, 30.0, 8.5) / 100
-        Tc = st.number_input("Tasa impositiva corporativa (%)", 0.0, 50.0, 21.0) / 100
+        global Rf, Rm, Tc0
+        Rf  = st.number_input("Risk-free (%)", 0.0, 20.0, 4.35) / 100
+        Rm  = st.number_input("Market return (%)", 0.0, 30.0, 8.5) / 100
+        Tc0 = st.number_input("Tax rate default (%)", 0.0, 50.0, 21.0) / 100
 
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()][:max_tickers]
+    tickers = [t.strip().upper() for t in tk_in.split(",") if t.strip()][:max_t]
 
-    # -------------- Botón de ejecución -------------------------
-    if st.button("🔍 Analizar Acciones", type="primary"):
+    # ---------- Ejecución ------------------------------------
+    if st.button("🔍 Analizar", type="primary"):
         if not tickers:
-            st.warning("Por favor ingresa al menos un ticker")
+            st.warning("Ingresa al menos un ticker")
             return
 
-        resultados, errores = {}, {}
-        barra = st.progress(0)
+        data_list, errs, bar = [], [], st.progress(0)
         for i, tk in enumerate(tickers, 1):
-            data = obtener_datos_financieros(tk)
-            if "Error" in data:
-                errores[tk] = data["Error"]
-            else:
-                resultados[tk] = data
-            barra.progress(i / len(tickers))
+            try:
+                data_list.append(obtener_datos_financieros(tk, Tc0))
+            except Exception as e:
+                errs.append({"Ticker": tk, "Error": str(e)})
+            bar.progress(i / len(tickers))
             time.sleep(1)
-        barra.empty()
+        bar.empty()
 
-        if not resultados:
-            st.error("No se pudo obtener datos válidos para ningún ticker")
-            if errores:
-                st.subheader("Errores detectados")
-                st.table(pd.DataFrame([{"Ticker": k, "Error": v} for k, v in errores.items()]))
+        if not data_list:
+            st.error("Sin datos válidos.")
+            if errs:
+                st.table(pd.DataFrame(errs))
             return
 
-        df = pd.DataFrame(resultados.values())
+        df = pd.DataFrame(data_list)
 
-        # formateo %
-        for col in [
-            "Dividend Yield %", "Payout Ratio", "ROA", "ROE",
-            "Oper Margin", "Profit Margin", "WACC", "ROIC"
-        ]:
+        # Formateo porcentual
+        pct_cols = ["Dividend Yield %", "Payout Ratio", "ROA", "ROE",
+                    "Oper Margin", "Profit Margin", "WACC", "ROIC"]
+        for col in pct_cols:
             df[col] = df[col].apply(lambda x: f"{x*100:,.2f}%" if pd.notnull(x) else "N/D")
 
-        # -------------- Sección 1: Resumen ----------------------
+        # --------- Sección 1: Resumen ---------------------------
         st.header("📋 Resumen General")
-        columnas_mostrar = [
-            "Ticker", "Nombre", "Sector", "Precio", "P/E", "P/B", "P/FCF",
-            "Dividend Yield %", "Payout Ratio", "ROA", "ROE", "Current Ratio",
-            "Debt/Eq", "Oper Margin", "Profit Margin", "WACC", "ROIC", "EVA"
-        ]
-        st.dataframe(df[columnas_mostrar].dropna(how='all', axis=1),
+        resumen_cols = ["Ticker", "Sector", "Precio", "P/E", "P/B", "P/FCF",
+                        "Dividend Yield %", "Payout Ratio", "ROA", "ROE",
+                        "Current Ratio", "Debt/Eq", "Oper Margin", "Profit Margin",
+                        "WACC", "ROIC", "EVA"]
+        st.dataframe(df[resumen_cols].dropna(how='all', axis=1),
                      use_container_width=True, height=400)
 
-        # Mostrar errores si existieran
-        if errores:
-            st.subheader("🚫 Tickers con error")
-            st.table(pd.DataFrame([{"Ticker": k, "Error": v} for k, v in errores.items()]))
+        if errs:
+            st.subheader("🚫 Errores")
+            st.table(pd.DataFrame(errs))
 
         # -------------- Sección 2: Valoración -------------------
         st.header("💰 Análisis de Valoración")
